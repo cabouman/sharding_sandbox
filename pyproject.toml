@@ -13,6 +13,7 @@ dependencies = [
     "numpy==2.2.3",
     "opt_einsum==3.4.0",
     "scipy==1.15.2",
+    "rich==15.0.0",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +21,7 @@ cuda12 = [
     "jax[cuda12]==0.5.2",
 ]
 
-# This project is a sandbox, not a library — no Python packages to install.
+# Expose the shared `utils/` package so experiments can `import utils`
+# regardless of which directory they're run from.
 [tool.setuptools]
-py-modules = []
+packages = ["utils"]
