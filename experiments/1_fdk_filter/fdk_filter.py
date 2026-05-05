@@ -1,6 +1,7 @@
 from typing import Literal, Union, Any, TextIO, overload
 import numpy as np
 from dataclasses import dataclass
+import h5py
 
 import jax
 import jax.numpy as jnp
@@ -30,14 +31,14 @@ class FDK:
     def __init__(self, sinogram_shape, source_detector_dist=None, source_iso_dist=None):
 
         cpus = jax.devices('cpu')
-        # gpus = jax.devices('gpu')
+        gpus = jax.devices('gpu')
 
-        # devices = np.array(gpus).reshape((-1, 1))
-        # mesh = Mesh(devices, ('views', 'rows'))
+        devices = np.array(gpus).reshape((-1, 1))
+        mesh = Mesh(devices, ('views', 'rows'))
 
         self.main_device = cpus[0]
-        self.sinogram_device = self.main_device
-        self.replicated_device = self.main_device
+        self.sinogram_device = NamedSharding(mesh, P('views'))
+        self.replicated_device = NamedSharding(mesh, P())
 
         self.entries_per_cylinder_batch = 100
 
@@ -200,27 +201,12 @@ class FDK:
         return magnification
 
     def fdk_filter(self, sinogram, filter_name="ramp", view_batch_size=DIRECT_RECON_VIEW_BATCH_SIZE):
-        """
-        Perform FDK filtering on the given sinogram.
 
-        Args:
-            sinogram (jax array): The input sinogram with shape (num_views, num_rows, num_channels).
-            filter_name (string, optional): Name of the filter to be used. Defaults to "ramp"
-            view_batch_size (int, optional):  Size of view batches (used to limit memory use)
-
-        Returns:
-            filtered_sinogram (jax array): The sinogram after FDK filtering.
-        """
         # Get parameters
         num_views, num_rows, num_channels = sinogram.shape
         source_detector_dist, source_iso_dist = self.get_params(['source_detector_dist', 'source_iso_dist'])
         delta_voxel, delta_det_row, delta_det_channel = self.get_params(['delta_voxel', 'delta_det_row', 'delta_det_channel'])
         det_row_offset, det_channel_offset = self.get_params(['det_row_offset', 'det_channel_offset'])
-
-        if view_batch_size is None:
-            view_batch_size = self.view_batch_size_for_vmap
-            max_view_batch_size = 128  # Limit the view batch size here and ParallelBeam due to https://github.com/jax-ml/jax/issues/27591
-            view_batch_size = min(view_batch_size, max_view_batch_size)
 
         # Magnification factor M_0 = Source-Detector Distance / Source-Isocenter Distance
         M_0 = self.get_magnification()
@@ -264,7 +250,7 @@ class FDK:
         # Apply convolution across the channels of the weighted sinogram per each fixed view & row
         num_views = sinogram.shape[0]
 
-        num_devices = 1 # self.sinogram_device.mesh.devices.size
+        num_devices = 100 # self.sinogram_device.mesh.devices.size
         filtered_sinogram = jax.lax.map(apply_convolution_to_view, weighted_sinogram, batch_size=num_devices)
         filtered_sinogram.block_until_ready()
         del weighted_sinogram
@@ -273,7 +259,7 @@ class FDK:
         return filtered_sinogram
     
 if __name__ == "__main__":
-    
+    # SIZES=(128 256 512 1024 1280 1536 1792 2048)
     sinogram_shape = (16, 16, 16)
     fdk_obj = FDK(sinogram_shape)
 
