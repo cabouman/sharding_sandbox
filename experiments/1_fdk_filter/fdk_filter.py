@@ -188,25 +188,28 @@ def viewer():
     import mbirjax as mj
     import h5py
 
-    num_views = 256
-    num_det_rows = 256
-    num_det_channels = 256
+    num_views = 2048
+    num_det_rows = 2048
+    num_det_channels = 2048
 
     output_directory = f"/scratch/gautschi/ncardel/recon_mem"
     h5_path = f"{output_directory}/cone_{num_views}_{num_det_rows}_{num_det_channels}_projection_data.h5"
     with h5py.File(h5_path, "r") as f:
         sinogram = f["sinogram"][:]
 
+    with h5py.File(h5_path, "r") as f:
+        sinogram2 = f["sinogram"][:]
 
     fdk_obj = FDK(sinogram.shape)
+    sinogram2 = jax.device_put(sinogram2, fdk_obj.sinogram_device)
     sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
+
+    t0 = time.perf_counter()
     filtered_sinogram = fdk_obj.fdk_filter(sinogram)
+    filtered_sinogram.block_until_ready()
+    print(f"fdk_filter: {time.perf_counter() - t0:.2f}s")
 
-    # with h5py.File(h5_path, "r") as f:
-    #     sinogram = f["sinogram"][:]
-    # sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
-    # mj.slice_viewer(sinogram, title='Un-filtered sinogram.') # array has been deleted error
-
+    mj.slice_viewer(sinogram2, title='Un-filtered sinogram.')
     mj.slice_viewer(filtered_sinogram, title='FDK filtered sinogram.')
 
 
@@ -219,7 +222,7 @@ if __name__ == "__main__":
 
     # sinogram_shape = (16, 16, 16)
     sinogram_shape = (1792, 1792, 1792)
-    # sinogram_shape = (2048, 2048, 2048)
+    sinogram_shape = (2048, 2048, 2048)
     fdk_obj = FDK(sinogram_shape)
     sinogram = jnp.ones(sinogram_shape, dtype=jnp.float32)
     sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
