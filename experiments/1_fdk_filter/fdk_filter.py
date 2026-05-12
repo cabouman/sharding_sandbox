@@ -160,17 +160,15 @@ class FDK:
         def scale(arr, factor):
             return arr * factor
 
-        # Operate in-place on the sinogram buffer: extract each chunk as a copy,
-        # process it, then donate the buffer back for the write — avoids a second
-        # full-array allocation and halves peak GPU memory vs a separate output buffer.
-        arr = jnp.copy(sinogram)
+        # np.zeros on CPU + device_put shards each slice directly to its GPU —
+        # no single device ever holds the full array.
+        filtered = jax.device_put(np.zeros(sinogram.shape, dtype=np.float32), self.sinogram_device)
 
         for start in range(0, num_views, view_chunk_size):
             end = min(start + view_chunk_size, num_views)
             chunk_views = end - start
 
-            # Slice creates an independent copy; arr's buffer remains intact until write_chunk
-            chunk = arr[start:end]
+            chunk = sinogram[start:end]
             if chunk_views < view_chunk_size:
                 chunk = jnp.pad(chunk, ((0, view_chunk_size - chunk_views), (0, 0), (0, 0)))
 
@@ -179,10 +177,10 @@ class FDK:
             del chunk
 
             update = result if chunk_views == view_chunk_size else result[:chunk_views]
-            arr = write_chunk(arr, update, jnp.array(start, dtype=jnp.int32))
+            filtered = write_chunk(filtered, update, jnp.array(start, dtype=jnp.int32))
             del result
 
-        return scale(arr, jnp.pi / num_views)
+        return scale(filtered, jnp.pi / num_views)
 
 def viewer():
     import mbirjax as mj
@@ -217,14 +215,14 @@ if __name__ == "__main__":
     # testing
 
     # sinogram_shape = (16, 16, 16)
-    sinogram_shape = (1792, 1792, 1792)
-    sinogram_shape = (2048, 2048, 2048)
-    fdk_obj = FDK(sinogram_shape)
-    sinogram = jnp.ones(sinogram_shape, dtype=jnp.float32)
-    sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
-    t0 = time.perf_counter()
-    filtered_sinogram = fdk_obj.fdk_filter(sinogram)
-    filtered_sinogram.block_until_ready()
-    print(f"fdk_filter: {time.perf_counter() - t0:.2f}s")
+    # sinogram_shape = (1792, 1792, 1792)
+    # sinogram_shape = (2048, 2048, 2048)
+    # fdk_obj = FDK(sinogram_shape)
+    # sinogram = jnp.ones(sinogram_shape, dtype=jnp.float32)
+    # sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
+    # t0 = time.perf_counter()
+    # filtered_sinogram = fdk_obj.fdk_filter(sinogram)
+    # filtered_sinogram.block_until_ready()
+    # print(f"fdk_filter: {time.perf_counter() - t0:.2f}s")
 
     print("complete")
