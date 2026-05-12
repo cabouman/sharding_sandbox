@@ -107,6 +107,7 @@ class FDK:
         return recon_filter
 
     def get_magnification(self):
+        global source_detector_dist
         if jnp.isinf(source_detector_dist):
             return 1
         return source_detector_dist / source_iso_dist
@@ -143,8 +144,7 @@ class FDK:
         def apply_convolution_to_view(view):
             return jax.lax.map(convolve_row, view, batch_size=row_batch_size)
 
-        num_devices = 100
-        filtered_sinogram = jax.lax.map(apply_convolution_to_view, weighted_sinogram, batch_size=num_devices)
+        filtered_sinogram = jax.lax.map(apply_convolution_to_view, weighted_sinogram, batch_size=4)
         filtered_sinogram.block_until_ready()
         del weighted_sinogram
         filtered_sinogram *= jnp.pi / num_views
@@ -176,11 +176,16 @@ def viewer():
 if __name__ == "__main__":
 
     # viewer for verifying sinogram is filtered right
-    viewer()
+    # viewer()
 
     # testing
-    sinogram_shape = (16, 16, 16)
+
+    # sinogram_shape = (16, 16, 16)
+    sinogram_shape = (1792, 1792, 1792)
+    # sinogram_shape = (2048, 2048, 2048)
     fdk_obj = FDK(sinogram_shape)
     sinogram = jnp.ones(sinogram_shape)
     sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
     filtered_sinogram = fdk_obj.fdk_filter(sinogram)
+
+    print("complete")
