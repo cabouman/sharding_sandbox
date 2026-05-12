@@ -163,7 +163,7 @@ class FDK:
         # Operate in-place on the sinogram buffer: extract each chunk as a copy,
         # process it, then donate the buffer back for the write — avoids a second
         # full-array allocation and halves peak GPU memory vs a separate output buffer.
-        arr = sinogram
+        arr = jnp.copy(sinogram)
 
         for start in range(0, num_views, view_chunk_size):
             end = min(start + view_chunk_size, num_views)
@@ -197,11 +197,7 @@ def viewer():
     with h5py.File(h5_path, "r") as f:
         sinogram = f["sinogram"][:]
 
-    with h5py.File(h5_path, "r") as f:
-        sinogram2 = f["sinogram"][:]
-
     fdk_obj = FDK(sinogram.shape)
-    sinogram2 = jax.device_put(sinogram2, fdk_obj.sinogram_device)
     sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
 
     t0 = time.perf_counter()
@@ -209,7 +205,7 @@ def viewer():
     filtered_sinogram.block_until_ready()
     print(f"fdk_filter: {time.perf_counter() - t0:.2f}s")
 
-    mj.slice_viewer(sinogram2, title='Un-filtered sinogram.')
+    mj.slice_viewer(sinogram, title='Un-filtered sinogram.')
     mj.slice_viewer(filtered_sinogram, title='FDK filtered sinogram.')
 
 
