@@ -1,4 +1,5 @@
 import functools
+import time
 import numpy as np
 
 import jax
@@ -134,7 +135,7 @@ class FDK:
         alpha = delta_det_row / (delta_voxel**3 * M_0)
         recon_filter = alpha * jax.device_put(recon_filter, self.replicated_device)
 
-        row_batch_size = min(num_rows, self.entries_per_cylinder_batch)
+        row_batch_size = 50 #min(num_rows, self.entries_per_cylinder_batch)
 
         num_gpus = len(jax.devices('gpu'))
         if view_chunk_size is None:
@@ -155,54 +156,64 @@ class FDK:
         def write_chunk(output, update, start):
             return jax.lax.dynamic_update_slice(output, update, (start, 0, 0))
 
-        # Pre-allocate full output on GPU with sinogram sharding
-        filtered = jax.device_put(jnp.zeros(sinogram.shape, dtype=jnp.float32), self.sinogram_device)
+        @functools.partial(jax.jit, donate_argnums=(0,))
+        def scale(arr, factor):
+            return arr * factor
+
+        # Operate in-place on the sinogram buffer: extract each chunk as a copy,
+        # process it, then donate the buffer back for the write — avoids a second
+        # full-array allocation and halves peak GPU memory vs a separate output buffer.
+        arr = sinogram
 
         for start in range(0, num_views, view_chunk_size):
             end = min(start + view_chunk_size, num_views)
             chunk_views = end - start
 
-            chunk = sinogram[start:end]
-            # Pad to view_chunk_size so process_chunk always sees the same shape
+            # Slice creates an independent copy; arr's buffer remains intact until write_chunk
+            chunk = arr[start:end]
             if chunk_views < view_chunk_size:
                 chunk = jnp.pad(chunk, ((0, view_chunk_size - chunk_views), (0, 0), (0, 0)))
 
             result = process_chunk(chunk)
             result.block_until_ready()
+            del chunk
 
-            # Trim padding before writing so dynamic_update_slice stays in bounds
             update = result if chunk_views == view_chunk_size else result[:chunk_views]
-            filtered = write_chunk(filtered, update, jnp.array(start, dtype=jnp.int32))
+            arr = write_chunk(arr, update, jnp.array(start, dtype=jnp.int32))
             del result
 
-        return filtered * (jnp.pi / num_views)
+        return scale(arr, jnp.pi / num_views)
 
 def viewer():
+    import mbirjax as mj
+    import h5py
+
     num_views = 256
     num_det_rows = 256
     num_det_channels = 256
 
     output_directory = f"/scratch/gautschi/ncardel/recon_mem"
     h5_path = f"{output_directory}/cone_{num_views}_{num_det_rows}_{num_det_channels}_projection_data.h5"
-    import h5py
     with h5py.File(h5_path, "r") as f:
         sinogram = f["sinogram"][:]
+
 
     fdk_obj = FDK(sinogram.shape)
     sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
     filtered_sinogram = fdk_obj.fdk_filter(sinogram)
 
-    try:
-        import mbirjax as mj
-        mj.slice_viewer(sinogram, title='Un-filtered sinogram.')
-        mj.slice_viewer(filtered_sinogram, title='FDK filtered sinogram.')
-    finally:
-        pass
+    # with h5py.File(h5_path, "r") as f:
+    #     sinogram = f["sinogram"][:]
+    # sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
+    # mj.slice_viewer(sinogram, title='Un-filtered sinogram.') # array has been deleted error
+
+    mj.slice_viewer(filtered_sinogram, title='FDK filtered sinogram.')
+
 
 if __name__ == "__main__":
 
     # viewer for verifying sinogram is filtered right
-    # viewer()
+    viewer()
 
     # testing
 
@@ -212,6 +223,9 @@ if __name__ == "__main__":
     fdk_obj = FDK(sinogram_shape)
     sinogram = jnp.ones(sinogram_shape, dtype=jnp.float32)
     sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
+    t0 = time.perf_counter()
     filtered_sinogram = fdk_obj.fdk_filter(sinogram)
+    filtered_sinogram.block_until_ready()
+    print(f"fdk_filter: {time.perf_counter() - t0:.2f}s")
 
     print("complete")
