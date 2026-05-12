@@ -128,8 +128,6 @@ class FDK:
         weight_map = source_detector_dist / jnp.sqrt(source_detector_dist ** 2 + u_grid**2 + v_grid**2)
 
         weight_map = jax.device_put(weight_map, self.replicated_device)
-        weighted_sinogram = sinogram * weight_map[None, :, :]
-        del weight_map
 
         recon_filter = self.generate_direct_recon_filter(num_channels, filter_name=filter_name)
         alpha = delta_det_row / (delta_voxel**3 * M_0)
@@ -140,13 +138,14 @@ class FDK:
             return jax.scipy.signal.fftconvolve(row, recon_filter, mode="valid")
 
         row_batch_size = min(num_rows, self.entries_per_cylinder_batch)
+        row_batch_size = 10
 
-        def apply_convolution_to_view(view):
-            return jax.lax.map(convolve_row, view, batch_size=row_batch_size)
+        def apply_weight_and_convolve(view):
+            weighted_view = view * weight_map
+            return jax.lax.map(convolve_row, weighted_view, batch_size=row_batch_size)
 
-        filtered_sinogram = jax.lax.map(apply_convolution_to_view, weighted_sinogram, batch_size=4)
+        filtered_sinogram = jax.lax.map(apply_weight_and_convolve, sinogram, batch_size=1)
         filtered_sinogram.block_until_ready()
-        del weighted_sinogram
         filtered_sinogram *= jnp.pi / num_views
 
         return filtered_sinogram
