@@ -1,34 +1,29 @@
-from typing import Literal, Union, Any, TextIO, overload
 import numpy as np
-from dataclasses import dataclass
-import h5py
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 
-@dataclass
-class Param:
-    val: Any
-    recompile_flag: bool = True
+DIRECT_RECON_VIEW_BATCH_SIZE = 100
 
-    def __repr__(self):
-        return f"Param(val={self.val}, recompile_flag={self.recompile_flag})"
-    
-ParamNames = Literal[
-    'geometry_type', 'file_format', 'sinogram_shape', 'delta_det_channel',
-    'delta_det_row', 'det_row_offset', 'det_channel_offset', 'sigma_y',
-    'alu_unit', 'alu_value', 'recon_shape', 'delta_voxel', 'sigma_x', 'sigma_prox',
-    'p', 'q', 'T', 'qggmrf_nbr_wts',
-    'auto_regularize_flag', 'positivity_flag', 'snr_db', 'sharpness',
-    'granularity', 'partition_sequence', 'verbose', 'use_gpu',
-]
+geometry_type = None
+sinogram_shape = None
+source_detector_dist = None
+source_iso_dist = None
+delta_det_channel = 1.0
+delta_det_row = 1.0
+det_row_offset = 0.0
+det_channel_offset = 0.0
+delta_voxel = None
+sigma_y = 1.0
+alu_unit = None
+alu_value = 1.0
 
-DIRECT_RECON_VIEW_BATCH_SIZE = 100  # This is set here due to a bug in jax.vmap when the batch size is too large.
 
 class FDK:
 
-    def __init__(self, sinogram_shape, source_detector_dist=None, source_iso_dist=None):
+    def __init__(self, input_sinogram_shape, input_source_detector_dist=None, input_source_iso_dist=None):
+        global sinogram_shape, source_detector_dist, source_iso_dist, delta_det_channel, delta_voxel
 
         cpus = jax.devices('cpu')
         gpus = jax.devices('gpu')
@@ -39,88 +34,22 @@ class FDK:
         self.main_device = cpus[0]
         self.sinogram_device = NamedSharding(mesh, P('views'))
         self.replicated_device = NamedSharding(mesh, P())
-
         self.entries_per_cylinder_batch = 100
 
-        num_views, num_det_rows, num_det_channels = sinogram_shape
-        if source_detector_dist is None:
-            source_detector_dist = 4 * num_det_channels
-        if source_iso_dist is None:
-            source_iso_dist = source_detector_dist
+        num_views, num_det_rows, num_det_channels = input_sinogram_shape
+        if input_source_detector_dist is None:
+            input_source_detector_dist = 4 * num_det_channels
+        if input_source_iso_dist is None:
+            input_source_iso_dist = input_source_detector_dist
 
+        magnification = input_source_detector_dist / input_source_iso_dist
+
+        sinogram_shape = input_sinogram_shape
+        source_detector_dist = input_source_detector_dist
+        source_iso_dist = input_source_iso_dist
         delta_det_channel = 1.0
-        magnification = source_detector_dist / source_iso_dist
-        delta_voxel = delta_det_channel / magnification
+        delta_voxel = 1.0 / magnification
 
-        self.params = {
-            'geometry_type': Param(None, False),  # The geometry type should never change during a recon.
-            'sinogram_shape': Param(sinogram_shape, True),
-            'source_detector_dist': Param(source_detector_dist, True),
-            'source_iso_dist': Param(source_iso_dist, True),
-            'delta_det_channel': Param(delta_det_channel, True),
-            'delta_det_row': Param(1.0, True),
-            'det_row_offset': Param(0.0, True),
-            'det_channel_offset': Param(0.0, True),
-            'delta_voxel': Param(delta_voxel, True),
-            'sigma_y': Param(1.0, False),
-            'alu_unit': Param(None, False),
-            'alu_value': Param(1.0, False),
-        }
-
-        # self.sinogram_device = NamedSharding(mesh, P('views'))
-        # self.replicated_device = NamedSharding(mesh, P())
-
-        pass
-
-    def get_params(self, parameter_names: Union[ParamNames, list[ParamNames]]) -> Any:
-        """
-        Get the values of the listed parameter names from the internal parameter dictionary.
-
-        This method retrieves the current values of one or more parameters managed by the model.
-
-        Args:
-            parameter_names (str or list of str): Name of a parameter, or a list of parameter names.
-
-        Returns:
-            Any or list: Single parameter value if a string is passed, or a list of values if a list is passed.
-
-        Raises:
-            NameError: If any of the provided parameter names are not recognized.
-
-        Example:
-            >>> sharpness = model.get_params('sharpness')
-            >>> recon_shape, sharpness = model.get_params(['recon_shape', 'sharpness'])
-        """
-        param_values = self.get_params_from_dict(self.params, parameter_names)
-        return param_values
-
-    @staticmethod
-    def get_params_from_dict(param_dict, parameter_names: Union[str, list[str]]):
-        """
-        Get the values of the listed parameter names from the supplied dict.
-        Raises an exception if a parameter name is not defined in parameters.
-
-        Args:
-            param_dict (dict): The dictionary of parameters
-            parameter_names (str or list of str): String or list of strings
-
-        Returns:
-            Single value or list of values
-        """
-        if isinstance(parameter_names, str):
-            if parameter_names in param_dict.keys():
-                value = param_dict[parameter_names].val
-            else:
-                raise NameError('"{}" is not a recognized argument'.format(parameter_names))
-            return value
-        values = []
-        for name in parameter_names:
-            if name in param_dict.keys():
-                values.append(param_dict[name].val)
-            else:
-                raise NameError('"{}" is not a recognized argument'.format(name))
-        return values
-    
     @staticmethod
     @jax.jit
     def detector_mn_to_uv(m, n, delta_det_channel, delta_det_row, det_channel_offset, det_row_offset, num_det_rows,
@@ -142,16 +71,14 @@ class FDK:
             u: Physical detector coordinate in the channel direction.
             v: Physical detector coordinate in the row direction.
         """
-        # Calculate the center of the detector grid
         det_center_row = (num_det_rows - 1) / 2.0
         det_center_channel = (num_det_channels - 1) / 2.0
 
-        # Compute detector coordinates (u, v)
         v = (m - det_center_row) * delta_det_row - det_row_offset
         u = (n - det_center_channel) * delta_det_channel - det_channel_offset
 
         return u, v
-    
+
     @staticmethod
     def generate_direct_recon_filter(num_channels, filter_name="ramp"):
         """
@@ -166,19 +93,12 @@ class FDK:
         Returns:
             filter (jnp): The computed filter (filter.size = 2*num_channels + 1).
         """
-
-        # If you want to add a new filter, place its name into supported_filters, and ...
-        # ... create a new if statement with the filter math.
-        # TODO:  Anyone who adds a second filter will need to address how to document the set of available filters
-        # in a way that is easy to maintain and appears correctly on readthedocs.  Also, any new filters will need
-        # to have the proper scaling.
         supported_filters = ["ramp"]
 
-        # Raise error if filter is not supported.
         if filter_name not in supported_filters:
             raise ValueError(f"Unsupported filter. Supported filters are: {', '.join(supported_filters)}.")
 
-        n = jnp.arange(-num_channels + 1, num_channels)  # ex: num_channels = 3, -> n = [-2, -1, 0, 1, 2]
+        n = jnp.arange(-num_channels + 1, num_channels)
 
         recon_filter = 0
         if filter_name == "ramp":
@@ -187,84 +107,80 @@ class FDK:
         return recon_filter
 
     def get_magnification(self):
-        """
-        Returns the magnification for the cone beam geometry.
-
-        Returns:
-            magnification = source_detector_dist / source_iso_dist
-        """
-        source_detector_dist, source_iso_dist = self.get_params(['source_detector_dist', 'source_iso_dist'])
         if jnp.isinf(source_detector_dist):
-            magnification = 1
-        else:
-            magnification = source_detector_dist / source_iso_dist
-        return magnification
+            return 1
+        return source_detector_dist / source_iso_dist
 
     def fdk_filter(self, sinogram, filter_name="ramp", view_batch_size=DIRECT_RECON_VIEW_BATCH_SIZE):
 
-        # Get parameters
         num_views, num_rows, num_channels = sinogram.shape
-        source_detector_dist, source_iso_dist = self.get_params(['source_detector_dist', 'source_iso_dist'])
-        delta_voxel, delta_det_row, delta_det_channel = self.get_params(['delta_voxel', 'delta_det_row', 'delta_det_channel'])
-        det_row_offset, det_channel_offset = self.get_params(['det_row_offset', 'det_channel_offset'])
 
-        # Magnification factor M_0 = Source-Detector Distance / Source-Isocenter Distance
         M_0 = self.get_magnification()
 
-        # Define the index arrays for channels and rows
-        m = jnp.arange(num_rows)  # Column vector for rows
-        n = jnp.arange(num_channels)  # Row vector for channels
+        m = jnp.arange(num_rows)
+        n = jnp.arange(num_channels)
         m_grid, n_grid = jnp.meshgrid(m, n, indexing='ij')
 
-        # Coordinate transformation to physical distances:
         u_grid, v_grid = self.detector_mn_to_uv(m_grid, n_grid, delta_det_channel, delta_det_row,
                                                 det_channel_offset, det_row_offset, num_rows, num_channels)
 
-        # Compute the weight
         weight_map = source_detector_dist / jnp.sqrt(source_detector_dist ** 2 + u_grid**2 + v_grid**2)
 
-        # Apply the pre-weighting factor to the sinogram
         weight_map = jax.device_put(weight_map, self.replicated_device)
         weighted_sinogram = sinogram * weight_map[None, :, :]
         del weight_map
 
-        # Compute the scaled filter
-        # Scaling factor alpha adjusts the filter to account for voxel size, ensuring consistent reconstruction.
-        # For a detailed theoretical derivation of this scaling factor, please refer to the zip file linked at
-        # https://mbirjax.readthedocs.io/en/latest/theory.html
         recon_filter = self.generate_direct_recon_filter(num_channels, filter_name=filter_name)
         alpha = delta_det_row / (delta_voxel**3 * M_0)
         recon_filter = alpha * recon_filter
         recon_filter = jax.device_put(recon_filter, self.replicated_device)
 
-        # Define convolution for a single row (across its channels)
         def convolve_row(row):
             return jax.scipy.signal.fftconvolve(row, recon_filter, mode="valid")
 
-        # Apply above convolve func across each row of a view, batching rows to bound peak memory
-        row_batch_size = min(num_rows, self.entries_per_cylinder_batch) 
+        row_batch_size = min(num_rows, self.entries_per_cylinder_batch)
 
         def apply_convolution_to_view(view):
             return jax.lax.map(convolve_row, view, batch_size=row_batch_size)
 
-        # Apply convolution across the channels of the weighted sinogram per each fixed view & row
-        num_views = sinogram.shape[0]
-
-        num_devices = 100 # self.sinogram_device.mesh.devices.size
+        num_devices = 100
         filtered_sinogram = jax.lax.map(apply_convolution_to_view, weighted_sinogram, batch_size=num_devices)
         filtered_sinogram.block_until_ready()
         del weighted_sinogram
         filtered_sinogram *= jnp.pi / num_views
 
         return filtered_sinogram
-    
+
+def viewer():
+    num_views = 256
+    num_det_rows = 256
+    num_det_channels = 256
+
+    output_directory = f"/scratch/gautschi/ncardel/recon_mem"
+    h5_path = f"{output_directory}/cone_{num_views}_{num_det_rows}_{num_det_channels}_projection_data.h5"
+    import h5py
+    with h5py.File(h5_path, "r") as f:
+        sinogram = f["sinogram"][:]
+
+    fdk_obj = FDK(sinogram.shape)
+    sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
+    filtered_sinogram = fdk_obj.fdk_filter(sinogram)
+
+    try:
+        import mbirjax as mj
+        mj.slice_viewer(sinogram, title='Un-filtered sinogram.')
+        mj.slice_viewer(filtered_sinogram, title='FDK filtered sinogram.')
+    finally:
+        pass
+
 if __name__ == "__main__":
-    # SIZES=(128 256 512 1024 1280 1536 1792 2048)
+
+    # viewer for verifying sinogram is filtered right
+    viewer()
+
+    # testing
     sinogram_shape = (16, 16, 16)
     fdk_obj = FDK(sinogram_shape)
-
-    # create sinogram object, place on gpus
     sinogram = jnp.ones(sinogram_shape)
     sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
-
-    fdk_obj.fdk_filter(sinogram)
+    filtered_sinogram = fdk_obj.fdk_filter(sinogram)
