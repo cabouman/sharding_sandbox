@@ -1,3 +1,4 @@
+import functools
 import numpy as np
 
 import jax
@@ -112,7 +113,8 @@ class FDK:
             return 1
         return source_detector_dist / source_iso_dist
 
-    def fdk_filter(self, sinogram, filter_name="ramp", view_batch_size=DIRECT_RECON_VIEW_BATCH_SIZE):
+    def fdk_filter(self, sinogram, filter_name="ramp", view_chunk_size=None):
+        # sinogram may be a numpy array or a JAX array on any device
 
         num_views, num_rows, num_channels = sinogram.shape
 
@@ -126,29 +128,54 @@ class FDK:
                                                 det_channel_offset, det_row_offset, num_rows, num_channels)
 
         weight_map = source_detector_dist / jnp.sqrt(source_detector_dist ** 2 + u_grid**2 + v_grid**2)
-
         weight_map = jax.device_put(weight_map, self.replicated_device)
 
         recon_filter = self.generate_direct_recon_filter(num_channels, filter_name=filter_name)
         alpha = delta_det_row / (delta_voxel**3 * M_0)
-        recon_filter = alpha * recon_filter
-        recon_filter = jax.device_put(recon_filter, self.replicated_device)
-
-        def convolve_row(row):
-            return jax.scipy.signal.fftconvolve(row, recon_filter, mode="valid")
+        recon_filter = alpha * jax.device_put(recon_filter, self.replicated_device)
 
         row_batch_size = min(num_rows, self.entries_per_cylinder_batch)
-        row_batch_size = 10
 
-        def apply_weight_and_convolve(view):
-            weighted_view = view * weight_map
-            return jax.lax.map(convolve_row, weighted_view, batch_size=row_batch_size)
+        num_gpus = len(jax.devices('gpu'))
+        if view_chunk_size is None:
+            view_chunk_size = num_gpus * 32
+        # Round up to multiple of num_gpus so the chunk shards evenly
+        view_chunk_size = max(num_gpus, ((view_chunk_size + num_gpus - 1) // num_gpus) * num_gpus)
 
-        filtered_sinogram = jax.lax.map(apply_weight_and_convolve, sinogram, batch_size=1)
-        filtered_sinogram.block_until_ready()
-        filtered_sinogram *= jnp.pi / num_views
+        @jax.jit
+        def process_chunk(chunk):
+            def convolve_row(row):
+                return jax.scipy.signal.fftconvolve(row, recon_filter, mode="valid")
+            def apply_weight_and_convolve(view):
+                return jax.lax.map(convolve_row, view * weight_map, batch_size=row_batch_size)
+            return jax.lax.map(apply_weight_and_convolve, chunk, batch_size=4)
 
-        return filtered_sinogram
+        # donate_argnums=(0,) lets XLA reuse the output buffer in-place — no full copy
+        @functools.partial(jax.jit, donate_argnums=(0,))
+        def write_chunk(output, update, start):
+            return jax.lax.dynamic_update_slice(output, update, (start, 0, 0))
+
+        # Pre-allocate full output on GPU with sinogram sharding
+        filtered = jax.device_put(jnp.zeros(sinogram.shape, dtype=jnp.float32), self.sinogram_device)
+
+        for start in range(0, num_views, view_chunk_size):
+            end = min(start + view_chunk_size, num_views)
+            chunk_views = end - start
+
+            chunk = sinogram[start:end]
+            # Pad to view_chunk_size so process_chunk always sees the same shape
+            if chunk_views < view_chunk_size:
+                chunk = jnp.pad(chunk, ((0, view_chunk_size - chunk_views), (0, 0), (0, 0)))
+
+            result = process_chunk(chunk)
+            result.block_until_ready()
+
+            # Trim padding before writing so dynamic_update_slice stays in bounds
+            update = result if chunk_views == view_chunk_size else result[:chunk_views]
+            filtered = write_chunk(filtered, update, jnp.array(start, dtype=jnp.int32))
+            del result
+
+        return filtered * (jnp.pi / num_views)
 
 def viewer():
     num_views = 256
@@ -183,7 +210,7 @@ if __name__ == "__main__":
     sinogram_shape = (1792, 1792, 1792)
     # sinogram_shape = (2048, 2048, 2048)
     fdk_obj = FDK(sinogram_shape)
-    sinogram = jnp.ones(sinogram_shape)
+    sinogram = jnp.ones(sinogram_shape, dtype=jnp.float32)
     sinogram = jax.device_put(sinogram, fdk_obj.sinogram_device)
     filtered_sinogram = fdk_obj.fdk_filter(sinogram)
 
